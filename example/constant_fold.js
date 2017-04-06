@@ -488,11 +488,16 @@ const FOLD_MEMBER = function*(path) {
             if (desc) {
               const folded = value[key];
               if (IN_PRAGMA_POS(path)) {
-                if (key < value.length - 1) {
-                  return REPLACE(path, value.slice(0, key + 1));
+                if (value.length > 1) {
+                  REPLACE(
+                    path.get(['object']), TO_CONSTEXPR(value.slice(key, key + 1)));
+                  REPLACE(
+                    path.get(['property']), TO_CONSTEXPR(0));
+                  return path;
                 }
               }
               else if (typeof folded !== 'string') {
+                  console.log('FOLDING');
                 return REPLACE(path, TO_CONSTEXPR(value[key]));
               }
             }
