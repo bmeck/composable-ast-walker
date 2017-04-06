@@ -1,10 +1,11 @@
 // consumes <stdin> and performs constant folding
-// echo '0,1+2;' | node constant_fold.js
+// echo '"use strict";"_"[0],1+2;' | node constant_fold.js
 'use strict';
 const { NodePath } = require('../NodePath');
 const { WalkCombinator } = require('../WalkCombinator');
 
-const FOLDED = Symbol.for('folded');
+const $CONSTEXPR = Symbol.for('$CONSTEXTR');
+const $CONSTVALUE = Symbol.for('$CONSTVALUE');
 const IS_EMPTY = path => {
   return (path.node.type === 'BlockStatement' && path.node.body.length === 0) ||
     path.node.type === 'EmptyStatement';
@@ -65,25 +66,40 @@ const REPLACE = (path, folded) => {
 };
 // no mutation, this is an atomic value
 const EMPTY = Object.freeze({
-  [FOLDED]: true,
+  [$CONSTEXPR]: true,
   type: 'EmptyStatement',
 });
+const NULL = Object.freeze({
+  [$CONSTEXPR]: true,
+  type: 'Literal',
+  value: null,
+});
 const NAN = Object.freeze({
-  [FOLDED]: true,
+  [$CONSTEXPR]: true,
   type: 'UnaryExpression',
   operator: '+',
   argument: Object.freeze({
-    [FOLDED]: true,
+    [$CONSTEXPR]: true,
     type: 'Literal',
     value: '_',
   }),
 });
+const NEG_ZERO = Object.freeze({
+  [$CONSTEXPR]: true,
+  type: 'UnaryExpression',
+  operator: '-',
+  argument: Object.freeze({
+    [$CONSTEXPR]: true,
+    type: 'Literal',
+    value: 0,
+  }),
+});
 const UNDEFINED = Object.freeze({
-  [FOLDED]: true,
+  [$CONSTEXPR]: true,
   type: 'UnaryExpression',
   operator: 'void',
   argument: Object.freeze({
-    [FOLDED]: true,
+    [$CONSTEXPR]: true,
     type: 'Literal',
     value: 0,
   }),
@@ -106,6 +122,8 @@ const IS_CONSTEXPR = node => {
   if (typeof node !== 'object' || node === null) {
     return false;
   }
+  // DONT CALCULATE THINGS MULTIPLE TIMES!!@!@#
+  if (node[$CONSTEXPR]) return true;
   if (node.type === 'ArrayExpression') {
     for (let i = 0; i < node.elements.length; i++) {
       const element = node.elements[i];
@@ -131,6 +149,9 @@ const IS_UNDEFINED = node => {
   return node === UNDEFINED;
 };
 const CONSTVALUE = node => {
+  if (node[$CONSTVALUE]) {
+    return node[$CONSTVALUE];
+  }
   if (IS_UNDEFINED(node)) return void 0;
   if (IS_NAN(node)) return +'_';
   if (!IS_CONSTEXPR(node)) throw new Error('Not a CONSTEXPR');
@@ -152,17 +173,27 @@ const CONSTVALUE = node => {
   }
   return node.value;
 };
+const CONSTEXPRS = new Map();
+CONSTEXPRS.set(void 0, UNDEFINED);
+CONSTEXPRS.set(+'_', NAN);
+CONSTEXPRS.set(null, NULL);
 const TO_CONSTEXPR = value => {
-  if (value !== value) return NAN;
-  if (value === void 0) return UNDEFINED;
+  let is_neg_zero = 1 / value === -Infinity;
+  if (is_neg_zero) return NEG_ZERO;
+  if (CONSTEXPRS.has(value)) {
+    return CONSTEXPRS.get(value);
+  }
   if (typeof value === 'number') {
-    if (value < 0 || 1 / value === -Infinity) {
-      return {
-        [FOLDED]: true,
+    if (value < 0) {
+      const CONSTEXPR = Object.freeze({
+        [$CONSTEXPR]: true,
+        [$CONSTVALUE]: value,
         type: 'UnaryExpression',
         operator: '-',
-        argument: { type: 'Literal', value: -value },
-      };
+        argument: Object.freeze({ type: 'Literal', value: -value }),
+      });
+      CONSTEXPRS.set(value, CONSTEXPR);
+      return CONSTEXPR;
     }
   }
   if (
@@ -171,18 +202,22 @@ const TO_CONSTEXPR = value => {
     typeof value === 'boolean' ||
     typeof value === 'string'
   ) {
-    return {
-      [FOLDED]: true,
+    const CONSTEXPR = Object.freeze({
+      [$CONSTEXPR]: true,
+      [$CONSTVALUE]: value,
       type: 'Literal',
       value,
-    };
+    });
+    CONSTEXPRS.set(value, CONSTEXPR);
+    return CONSTEXPR;
   }
+  // have to generate new one every time :-/
   if (Array.isArray(value)) {
-    return {
-      [FOLDED]: true,
+    return Object.freeze({
+      [$CONSTEXPR]: true,
       type: 'ArrayExpression',
-      elements: value.map(TO_CONSTEXPR),
-    };
+      elements: Object.freeze(value.map(TO_CONSTEXPR)),
+    });
   }
   throw Error('Not a CONSTVALUE (did you pass a RegExp?)');
 };
@@ -235,10 +270,10 @@ const FOLD_EXPR_STMT = function*(path) {
           }
           if (mergeable.length > 1) {
             siblings.splice(path.key, mergeable.length, {
-              [FOLDED]: true,
+              [$CONSTEXPR]: true,
               type: 'ExpressionStatement',
               expression: {
-                [FOLDED]: true,
+                [$CONSTEXPR]: true,
                 type: 'SequenceExpression',
                 expressions: mergeable.reduce(
                   (acc, es) => {
@@ -467,7 +502,6 @@ const FOLD_MEMBER = function*(path) {
       if (typeof current === 'string' && /^[$_a-z][$_a-z\d]*$/i.test(current)) {
         path.node.computed = false;
         path.node.property = {
-          [FOLDED]: true,
           type: 'Identifier',
           name: current,
         };
@@ -487,7 +521,8 @@ const FOLD_MEMBER = function*(path) {
             const desc = Object.getOwnPropertyDescriptor(value, key);
             if (desc) {
               const folded = value[key];
-              if (IN_PRAGMA_POS(path)) {
+              console.error('FOLDING', JSON.stringify(folded))
+              if (IN_PRAGMA_POS(path) && typeof folded === 'string') {
                 if (value.length > 1) {
                   REPLACE(
                     path.get(['object']), TO_CONSTEXPR(value.slice(key, key + 1)));
@@ -496,8 +531,7 @@ const FOLD_MEMBER = function*(path) {
                   return path;
                 }
               }
-              else if (typeof folded !== 'string') {
-                  console.log('FOLDING');
+              else {
                 return REPLACE(path, TO_CONSTEXPR(value[key]));
               }
             }
@@ -511,15 +545,15 @@ const FOLD_MEMBER = function*(path) {
 const WALKER = WalkCombinator.pipe(
   ...[
     WalkCombinator.DEPTH_FIRST,
+    { inputs: FOLD_WHILE },
+    { inputs: FOLD_IF },
+    { inputs: FOLD_EXPR_STMT },
+    { inputs: FOLD_EMPTY },
+    { inputs: FOLD_CONDITIONAL },
+    { inputs: FOLD_LOGICAL },
     { inputs: FOLD_BINARY },
     { inputs: FOLD_UNARY },
     { inputs: FOLD_SEQUENCE },
-    { inputs: FOLD_LOGICAL },
-    { inputs: FOLD_EMPTY },
-    { inputs: FOLD_IF },
-    { inputs: FOLD_CONDITIONAL },
-    { inputs: FOLD_EXPR_STMT },
-    { inputs: FOLD_WHILE },
     { inputs: FOLD_MEMBER },
   ]
 );
@@ -529,8 +563,8 @@ process.stdin.pipe(
     const ROOT = new NodePath(
       null,
       require('esprima').parse(`${buff}`, {
-        loc: true,
-        source: '<stdin>',
+        // loc: true,
+        // source: '<stdin>',
       }),
       null
     );
