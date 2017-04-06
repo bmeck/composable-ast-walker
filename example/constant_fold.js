@@ -4,18 +4,51 @@
 const { NodePath } = require('../NodePath');
 const { WalkCombinator } = require('../WalkCombinator');
 
+const FOLDED = Symbol.for('folded');
 const IS_EMPTY = path => {
   return (path.node.type === 'BlockStatement' && path.node.body.length === 0) ||
     path.node.type === 'EmptyStatement';
 };
+const IN_PRAGMA_POS = path => {
+  if (path.parent && Array.isArray(path.parent.node)) {
+    const siblings = path.parent.node;
+    for (let i = 0; i < path.key; i++) {
+      // preceded by non-pragma
+      if (
+        siblings[i].type !== 'ExpressionStatement' ||
+        !IS_CONSTEXPR(siblings[i].expression) ||
+        typeof CONSTVALUE(siblings[i].expression) !== 'string'
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+const IS_PRAGMA = path => {
+  if (path.parent && Array.isArray(path.parent.node)) {
+    const siblings = path.parent.node;
+    for (let i = 0; i < path.key + 1; i++) {
+      // preceded by non-pragma
+      if (
+        siblings[i].type !== 'ExpressionStatement' ||
+        !IS_CONSTEXPR(siblings[i].expression) ||
+        typeof CONSTVALUE(siblings[i].expression) !== 'string'
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 const REMOVE_IF_EMPTY = path => {
   if (IS_EMPTY(path)) REMOVE(path);
   return null;
-}
+};
 const REPLACE_IF_EMPTY = (path, folded) => {
   if (IS_EMPTY(path)) return REPLACE(path, folded);
   return path;
-}
+};
 const REMOVE = path => {
   console.log(path);
   if (Array.isArray(path.parent.node)) {
@@ -32,17 +65,28 @@ const REPLACE = (path, folded) => {
 };
 // no mutation, this is an atomic value
 const EMPTY = Object.freeze({
+  [FOLDED]: true,
   type: 'EmptyStatement',
 });
 const NAN = Object.freeze({
+  [FOLDED]: true,
   type: 'UnaryExpression',
   operator: '+',
-  argument: Object.freeze({ type: 'Literal', value: '_' }),
+  argument: Object.freeze({
+    [FOLDED]: true,
+    type: 'Literal',
+    value: '_',
+  }),
 });
 const UNDEFINED = Object.freeze({
+  [FOLDED]: true,
   type: 'UnaryExpression',
   operator: 'void',
-  argument: Object.freeze({ type: 'Literal', value: 0 }),
+  argument: Object.freeze({
+    [FOLDED]: true,
+    type: 'Literal',
+    value: 0,
+  }),
 });
 // ESTree doesn't like negative numeric literals
 // this also preserves -0
@@ -114,6 +158,7 @@ const TO_CONSTEXPR = value => {
   if (typeof value === 'number') {
     if (value < 0 || 1 / value === -Infinity) {
       return {
+        [FOLDED]: true,
         type: 'UnaryExpression',
         operator: '-',
         argument: { type: 'Literal', value: -value },
@@ -126,13 +171,18 @@ const TO_CONSTEXPR = value => {
     typeof value === 'boolean' ||
     typeof value === 'string'
   ) {
-    return { type: 'Literal', value };
+    return {
+      [FOLDED]: true,
+      type: 'Literal',
+      value,
+    };
   }
   if (Array.isArray(value)) {
     return {
+      [FOLDED]: true,
       type: 'ArrayExpression',
-      elements: value.map(TO_CONSTEXPR)
-    }
+      elements: value.map(TO_CONSTEXPR),
+    };
   }
   throw Error('Not a CONSTVALUE (did you pass a RegExp?)');
 };
@@ -174,41 +224,36 @@ const FOLD_EXPR_STMT = function*(path) {
     if (Array.isArray(path.parent.node)) {
       // could have nodes after it
       const siblings = path.parent.node;
-      pragma: {
-        for (let i = 0; i < path.key + 1; i++) {
-          // preceded by non-pragma
-          if (siblings[i].type !== 'ExpressionStatement' || !IS_CONSTEXPR(siblings[i].expression) || typeof CONSTVALUE(siblings[i].expression) !== 'string') {
-            break pragma;
+      if (!IS_PRAGMA(path)) {
+        if (path.key < siblings.length - 1) {
+          const mergeable = [path.node];
+          for (let needle = path.key + 1; needle < siblings.length; needle++) {
+            if (siblings[needle].type !== 'ExpressionStatement') {
+              break;
+            }
+            mergeable.push(siblings[needle]);
           }
-        }
-        return yield path;
-      }
-      if (path.key < siblings.length - 1) {
-        const mergeable = [path.node];
-        for (let needle = path.key + 1; needle < siblings.length; needle++) {
-          if (siblings[needle].type !== 'ExpressionStatement') {
-            break;
+          if (mergeable.length > 1) {
+            siblings.splice(path.key, mergeable.length, {
+              [FOLDED]: true,
+              type: 'ExpressionStatement',
+              expression: {
+                [FOLDED]: true,
+                type: 'SequenceExpression',
+                expressions: mergeable.reduce(
+                  (acc, es) => {
+                    if (es.expression.type == 'SequenceExpression') {
+                      return [...acc, ...es.expression.expressions];
+                    } else {
+                      return [...acc, es.expression];
+                    }
+                  },
+                  []
+                ),
+              },
+            });
+            return path;
           }
-          mergeable.push(siblings[needle]);
-        }
-        if (mergeable.length > 1) {
-          siblings.splice(path.key, mergeable.length, {
-            type: 'ExpressionStatement',
-            expression: {
-              type: 'SequenceExpression',
-              expressions: mergeable.reduce(
-                (acc, es) => {
-                  if (es.expression.type == 'SequenceExpression') {
-                    return [...acc, ...es.expression.expressions];
-                  } else {
-                    return [...acc, es.expression];
-                  }
-                },
-                []
-              ),
-            },
-          });
-          return path;
         }
       }
     } else if (IS_CONSTEXPR(path.node.expression)) {
@@ -421,7 +466,11 @@ const FOLD_MEMBER = function*(path) {
       const current = `${CONSTVALUE(path.node.property)}`;
       if (typeof current === 'string' && /^[$_a-z][$_a-z\d]*$/i.test(current)) {
         path.node.computed = false;
-        path.node.property = { type: 'Identifier', name: current };
+        path.node.property = {
+          [FOLDED]: true,
+          type: 'Identifier',
+          name: current,
+        };
         return path;
       }
     }
@@ -432,13 +481,20 @@ const FOLD_MEMBER = function*(path) {
           if (path.node.property.name === 'length') {
             return REPLACE(path, TO_CONSTEXPR(value.length));
           }
-        }
-        else if (IS_CONSTEXPR(path.node.property)) {
+        } else if (IS_CONSTEXPR(path.node.property)) {
           const key = +`${CONSTVALUE(path.node.property)}`;
           if (key === key && key >= 0 && key < value.length) {
             const desc = Object.getOwnPropertyDescriptor(value, key);
             if (desc) {
-              return REPLACE(path, TO_CONSTEXPR(value[key]));
+              const folded = value[key];
+              if (IN_PRAGMA_POS(path)) {
+                if (key < value.length - 1) {
+                  return REPLACE(path, value.slice(0, key + 1));
+                }
+              }
+              else if (typeof folded !== 'string') {
+                return REPLACE(path, TO_CONSTEXPR(value[key]));
+              }
             }
           }
         }
