@@ -4,6 +4,27 @@
 const { NodePath } = require('../NodePath');
 const { WalkCombinator } = require('../WalkCombinator');
 
+const IS_EMPTY = path => {
+  return (path.node.type === 'BlockStatement' && path.node.body.length === 0) ||
+    path.node.type === 'EmptyStatement';
+};
+const REMOVE_IF_EMPTY = path => {
+  if (IS_EMPTY(path)) REMOVE(path);
+  return null;
+}
+const REPLACE_IF_EMPTY = (path, folded) => {
+  if (IS_EMPTY(path)) return REPLACE(path, folded);
+  return path;
+}
+const REMOVE = path => {
+  console.log(path);
+  if (Array.isArray(path.parent.node)) {
+    path.parent.node.splice(path.key, 1);
+  } else {
+    path.parent.node[path.key] = null;
+  }
+  return null;
+};
 const REPLACE = (path, folded) => {
   const replacement = new NodePath(path.parent, folded, path.key);
   path.parent.node[path.key] = folded;
@@ -41,6 +62,16 @@ const IS_CONSTEXPR = node => {
   if (typeof node !== 'object' || node === null) {
     return false;
   }
+  if (node.type === 'ArrayExpression') {
+    for (let i = 0; i < node.elements.length; i++) {
+      const element = node.elements[i];
+      // hole == null
+      if (element !== null && !IS_CONSTEXPR(element)) {
+        return false;
+      }
+    }
+    return true;
+  }
   if (node.type === 'Literal' || IS_UNDEFINED(node) || IS_NAN(node)) {
     return true;
   }
@@ -59,6 +90,16 @@ const CONSTVALUE = node => {
   if (IS_UNDEFINED(node)) return void 0;
   if (IS_NAN(node)) return +'_';
   if (!IS_CONSTEXPR(node)) throw new Error('Not a CONSTEXPR');
+  if (node.type === 'ArrayExpression') {
+    let ret = [];
+    ret.length = node.elements.length;
+    for (let i = 0; i < node.elements.length; i++) {
+      if (node.elements[i] !== null) {
+        ret[i] = CONSTVALUE(node.elements[i]);
+      }
+    }
+    return ret;
+  }
   if (IS_UNARY_NEGATIVE(node)) {
     return -node.argument.value;
   }
@@ -87,19 +128,25 @@ const TO_CONSTEXPR = value => {
   ) {
     return { type: 'Literal', value };
   }
+  if (Array.isArray(value)) {
+    return {
+      type: 'ArrayExpression',
+      elements: value.map(TO_CONSTEXPR)
+    }
+  }
   throw Error('Not a CONSTVALUE (did you pass a RegExp?)');
 };
+// THIS DOES NOT HANDLE NODE SPECIFIC CASES LIKE IfStatement
 const FOLD_EMPTY = function*(path) {
-  if (path && path.node) {
-    if (path.node.type === 'EmptyStatement') {
-      if (Array.isArray(path.parent.node)) {
-        path.parent.node.splice(path.key, 1);
-        return path.parent;
-      }
-    }
-    if (path.node.type === 'BlockStatement' && path.node.body.length === 0) {
-      return REPLACE(path, EMPTY);
-    }
+  if (
+    path &&
+    path.node &&
+    path.parent &&
+    Array.isArray(path.parent.node) &&
+    IS_EMPTY(path)
+  ) {
+    REMOVE(path);
+    return path.parent;
   }
   return yield path;
 };
@@ -163,6 +210,9 @@ const FOLD_EXPR_STMT = function*(path) {
 };
 const FOLD_WHILE = function*(path) {
   if (path && path.node) {
+    if (path.node.type === 'DoWhileStatement') {
+      REPLACE_IF_EMPTY(path.get(['body']), EMPTY);
+    }
     if (path.node.type === 'WhileStatement') {
       let { test, consequent, alternate } = path.node;
       if (IS_CONSTEXPR(test)) {
@@ -171,8 +221,10 @@ const FOLD_WHILE = function*(path) {
           return REPLACE(path, EMPTY);
         }
       }
+      REPLACE_IF_EMPTY(path.get(['body']), EMPTY);
     }
     if (path.node.type === 'ForStatement') {
+      REPLACE_IF_EMPTY(path.get(['body']), EMPTY);
       let { init, test, update } = path.node;
       let updated = false;
       if (init && IS_CONSTEXPR(init)) {
@@ -214,6 +266,16 @@ const FOLD_IF = function*(path) {
         return REPLACE(path, alternate);
       }
       return REPLACE(path, EMPTY);
+    }
+    consequent = path.get(['consequent']);
+    if (consequent.node !== EMPTY) {
+      REPLACE_IF_EMPTY(consequent, EMPTY);
+      return path;
+    }
+    if (alternate) {
+      alternate = path.get(['alternate']);
+      REMOVE_IF_EMPTY(alternate);
+      return alternate;
     }
   }
   return yield path;
@@ -330,10 +392,48 @@ const FOLD_UNARY = function*(path) {
         value = -value;
       } else if (operator === '+') {
         value = +value;
-      }
-      if (IS_UNARY_NEGATIVE) {
+      } else if (operator === '~') {
+        value = ~value;
+      } else if (operator === '!') {
+        value = !value;
+      } else if (operator === 'typeof') {
+        value = typeof value;
+      } else if (operator === 'delete') {
+        value = true;
       }
       return REPLACE(path, TO_CONSTEXPR(value));
+    }
+  }
+  return yield path;
+};
+const FOLD_MEMBER = function*(path) {
+  if (path && path.node && path.node.type === 'MemberExpression') {
+    if (path.node.computed && path.node.property.type === 'Literal') {
+      const current = `${CONSTVALUE(path.node.property)}`;
+      if (typeof current === 'string' && /^[$_a-z][$_a-z\d]*$/i.test(current)) {
+        path.node.computed = false;
+        path.node.property = { type: 'Identifier', name: current };
+        return path;
+      }
+    }
+    if (IS_CONSTEXPR(path.node.object)) {
+      const value = CONSTVALUE(path.node.object);
+      if (typeof value === 'string' || Array.isArray(value)) {
+        if (!path.node.computed) {
+          if (path.node.property.name === 'length') {
+            return REPLACE(path, TO_CONSTEXPR(value.length));
+          }
+        }
+        else if (IS_CONSTEXPR(path.node.property)) {
+          const key = +`${CONSTVALUE(path.node.property)}`;
+          if (key === key && key >= 0 && key < value.length) {
+            const desc = Object.getOwnPropertyDescriptor(value, key);
+            if (desc) {
+              return REPLACE(path, TO_CONSTEXPR(value[key]));
+            }
+          }
+        }
+      }
     }
   }
   return yield path;
@@ -350,6 +450,7 @@ const WALKER = WalkCombinator.pipe(
     { inputs: FOLD_CONDITIONAL },
     { inputs: FOLD_EXPR_STMT },
     { inputs: FOLD_WHILE },
+    { inputs: FOLD_MEMBER },
   ]
 );
 
@@ -366,6 +467,13 @@ process.stdin.pipe(
     const walk = WALKER.walk(ROOT);
     for (const _ of walk) {
     }
+    console.log(
+      '%s',
+      require('util').inspect(ROOT.node, {
+        depth: null,
+        colors: true,
+      })
+    );
     const out = require('escodegen').generate(ROOT.node);
     console.log(out);
   })
