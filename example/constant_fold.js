@@ -174,6 +174,15 @@ const FOLD_EXPR_STMT = function*(path) {
     if (Array.isArray(path.parent.node)) {
       // could have nodes after it
       const siblings = path.parent.node;
+      pragma: {
+        for (let i = 0; i < path.key + 1; i++) {
+          // preceded by non-pragma
+          if (siblings[i].type !== 'ExpressionStatement' || !IS_CONSTEXPR(siblings[i].expression) || typeof CONSTVALUE(siblings[i].expression) !== 'string') {
+            break pragma;
+          }
+        }
+        return yield path;
+      }
       if (path.key < siblings.length - 1) {
         const mergeable = [path.node];
         for (let needle = path.key + 1; needle < siblings.length; needle++) {
