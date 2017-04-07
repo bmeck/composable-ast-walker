@@ -267,7 +267,9 @@ const FOLD_EMPTY = function*(path) {
 const FOLD_EXPR_STMT = function*(path) {
   // TODO: enforce completion value checking
   if (path && path.node && path.node.type === 'ExpressionStatement') {
-    console.error('FOLD_EXPR_STMT');
+    console.error('FOLD_EXPR_STMT',
+      require('escodegen').generate(path.node)
+    );
     // merge all the adjacent expression statements into sequences
     if (Array.isArray(path.parent.node)) {
       // could have nodes after it
@@ -360,39 +362,62 @@ const FOLD_WHILE = function*(path) {
 };
 const FOLD_IF = function*(path) {
   if (path && path.node && path.node.type === 'IfStatement') {
-    console.error('FOLD_IF');
     let { test, consequent, alternate } = path.node;
     const is_not_completion = IS_NOT_COMPLETION(path);
     if (is_not_completion && !alternate) {
       if (IS_EMPTY(path.get(['consequent']))) {
-        return REPLACE(path, {
+        console.error('FOLD_IF_EMPTY_CONSEQUENT');
+        REPLACE(path, {
           type: 'ExpressionStatement',
           expression: test,
         });
+        return path.parent;
       }
     }
-    if (consequent.type === 'ExpressionStatement') {
-      if (alternate) {
-        if (alternate.type === 'ExpressionStatement') {
-          return REPLACE(path, {
+    if (alternate) {
+      if (alternate.type === consequent.type) {
+        if (consequent.type === 'ExpressionStatement') {
+          console.error('FOLD_IF_BOTH_EXPRSTMT');
+          REPLACE(path, {
+          type: 'ExpressionStatement', expression:
+          {
             type: 'ConditionalExpression',
             test: test,
             consequent: consequent.expression,
             alternate: alternate.expression,
+          }});
+          return path.parent;
+        }
+        else if (consequent.type === 'ReturnStatement' ||
+          consequent.type === 'ThrowStatement') {
+          console.error('FOLD_IF_BOTH_COMPLETIONS');
+          REPLACE(path, {
+          type: 'ExpressionStatement', expression:{
+            type: consequent.type,
+            argument: {
+              type: 'ConditionalExpression',
+              test: test,
+              consequent: consequent.argument,
+              alternate: alternate.argument,
+            }}
           });
+          return path.parent;
         }
       }
-      else if (is_not_completion) {
-        return REPLACE(path, {
-          type: 'ExpressionStatement',
-          expression: {
-            type: 'BinaryExpression',
-            operator: '&&',
-            left: test,
-            right: consequent.expression,
-          }
-        });
-      }
+    }
+    else if (is_not_completion && consequent.type === 'ExpressionStatement') {
+      console.error('FOLD_IF_NON_COMPLETION_TO_&&');
+      REPLACE(path, {
+        type: 'ExpressionStatement',
+        expression: {
+          type: 'BinaryExpression',
+          operator: '&&',
+          left: test,
+          right: consequent.expression,
+        }
+      });
+        console.log('RETRY', path.parent)
+      return path.parent;
     }
     if (IS_CONSTEXPR(test)) {
       test = CONSTVALUE(test);
@@ -700,6 +725,7 @@ process.stdin.pipe(
           },
         },
         { inputs: FOLD_UNREACHABLE },
+        { inputs: FOLD_IF },
         { inputs: FOLD_EXPR_STMT },
         { inputs: FOLD_CONDITIONAL },
         { inputs: FOLD_LOGICAL },
@@ -723,7 +749,6 @@ process.stdin.pipe(
           },
         },
         { inputs: FOLD_EMPTY },
-        { inputs: FOLD_IF },
         { inputs: FOLD_WHILE },
       ]
     ).walk(ROOT);
@@ -744,7 +769,6 @@ process.stdin.pipe(
     ).walk(ROOT);
     for (const _ of minify) {
     }
-    /*
     console.error(
       '%s',
       require('util').inspect(ROOT.node, {
@@ -752,7 +776,6 @@ process.stdin.pipe(
         colors: true,
       })
     );
-    */
     const out = require('escodegen').generate(ROOT.node);
     console.log(out);
   })

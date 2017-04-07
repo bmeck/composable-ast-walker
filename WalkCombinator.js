@@ -109,22 +109,23 @@ WalkCombinator.DEPTH_FIRST = Object.freeze(
   Object.create(null, {
     inputs: {
       value: function* DEFAULT_WALKER(path) {
+        console.log('COMPUTING AGAINST', path)
         const node = path.node;
         if (typeof node !== 'object' || !node) return;
         let returns = [];
         if (Array.isArray(node)) {
           for (let i = 0; i < node.length; i++) {
-            let retry;
+            let retry = path.get([i]);
             do {
-              retry = yield* DEFAULT_WALKER(path.get([i]));
+              retry = yield* DEFAULT_WALKER(retry);
             } while (retry !== void 0);
           }
         }
         else {
           for (const fieldName of Object.keys(node).sort()) {
-            let retry;
+            let retry = path.get([fieldName]);
             do {
-              retry = yield* DEFAULT_WALKER(path.get([fieldName]));
+              retry = yield* DEFAULT_WALKER(retry);
             } while (retry !== void 0);
           }
         }
