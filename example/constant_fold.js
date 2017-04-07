@@ -1,8 +1,8 @@
 // consumes <stdin> and performs constant folding
 // echo '"use strict";"_"[0],1+2;' | node constant_fold.js
 'use strict';
-const { NodePath } = require('../NodePath');
-const { WalkCombinator } = require('../WalkCombinator');
+const NodePath = require('../NodePath').NodePath;
+const WalkCombinator = require('../WalkCombinator').WalkCombinator;
 
 const $CONSTEXPR = Symbol.for('$CONSTEXTR');
 const $CONSTVALUE = Symbol.for('$CONSTVALUE');
@@ -514,44 +514,48 @@ const FOLD_BINARY = function*(path) {
     if (IS_CONSTEXPR(left) && IS_CONSTEXPR(right)) {
       left = CONSTVALUE(left);
       right = CONSTVALUE(right);
+      let value;
       if (operator === '+') {
-        return REPLACE(path, TO_CONSTEXPR(left + right));
+        value = left + right;
       } else if (operator === '-') {
-        return REPLACE(path, TO_CONSTEXPR(left - right));
+        value = left - right;
       } else if (operator === '*') {
-        return REPLACE(path, TO_CONSTEXPR(left * right));
+        value = left * right;
       } else if (operator === '/') {
-        return REPLACE(path, TO_CONSTEXPR(left / right));
+        value = left / right;
       } else if (operator === '%') {
-        return REPLACE(path, TO_CONSTEXPR(left % right));
+        value = left % right;
       } else if (operator === '==') {
-        return REPLACE(path, TO_CONSTEXPR(left == right));
+        value = left == right;
       } else if (operator === '!=') {
-        return REPLACE(path, TO_CONSTEXPR(left != right));
+        value = left != right;
       } else if (operator === '===') {
-        return REPLACE(path, TO_CONSTEXPR(left === right));
+        value = left === right;
       } else if (operator === '!==') {
-        return REPLACE(path, TO_CONSTEXPR(left !== right));
+        value = left !== right;
       } else if (operator === '<') {
-        return REPLACE(path, TO_CONSTEXPR(left < right));
+        value = left < right;
       } else if (operator === '<=') {
-        return REPLACE(path, TO_CONSTEXPR(left <= right));
+        value = left <= right;
       } else if (operator === '>') {
-        return REPLACE(path, TO_CONSTEXPR(left > right));
+        value = left > right;
       } else if (operator === '>=') {
-        return REPLACE(path, TO_CONSTEXPR(left >= right));
+        value = left >= right;
       } else if (operator === '<<') {
-        return REPLACE(path, TO_CONSTEXPR(left << right));
+        value = left << right;
       } else if (operator === '>>') {
-        return REPLACE(path, TO_CONSTEXPR(left >> right));
+        value = left >> right;
       } else if (operator === '>>>') {
-        return REPLACE(path, TO_CONSTEXPR(left >>> right));
+        value = left >>> right;
       } else if (operator === '|') {
-        return REPLACE(path, TO_CONSTEXPR(left | right));
+        value = left | right;
       } else if (operator === '&') {
-        return REPLACE(path, TO_CONSTEXPR(left & right));
+        value = left & right;
       } else if (operator === '^') {
-        return REPLACE(path, TO_CONSTEXPR(left ^ right));
+        value = left ^ right;
+      }
+      if (value == value && isFinite(value)) {
+        return REPLACE(path, TO_CONSTEXPR(value));
       }
     }
   }
@@ -636,6 +640,41 @@ const FOLD_MEMBER = function*(path) {
   return yield path;
 };
 
+const $MIN = Symbol();
+const MIN_TRUE = Object.freeze({
+  [$MIN]: true,
+  type: 'UnaryExpression',
+  operator: '!',
+  argument: Object.freeze({
+    [$MIN]: true,
+    type: 'Literal',
+    value: 0
+  })
+});
+const MIN_FALSE = Object.freeze({
+  [$MIN]: true,
+  type: 'UnaryExpression',
+  operator: '!',
+  argument: Object.freeze({
+    [$MIN]: true,
+    type: 'Literal',
+    value: 1
+  })
+});
+const MIN_REPLACEMENTS = new Map;
+MIN_REPLACEMENTS.set(true, MIN_TRUE);
+MIN_REPLACEMENTS.set(false, MIN_FALSE);
+const MIN_VALUES = function*(path) {
+  if (path && path.node && !path.node[$MIN] && IS_CONSTEXPR(path.node)) {
+    let value = CONSTVALUE(path.node);
+    if (MIN_REPLACEMENTS.has(value)) {
+      console.error('MIN_VALUE', value)
+      return REPLACE(path, MIN_REPLACEMENTS.get(value));
+    }
+  }
+  return yield path;
+}
+
 process.stdin.pipe(
   require('mississippi').concat(buff => {
     const ROOT = new NodePath(
@@ -689,6 +728,21 @@ process.stdin.pipe(
       ]
     ).walk(ROOT);
     for (const _ of walk_statements) {
+    }
+    const minify = WalkCombinator.pipe(
+      ...[
+        WalkCombinator.DEPTH_FIRST,
+        {
+          // We never work on Arrays
+          *inputs(path) {
+            if (Array.isArray(path)) return;
+            return yield path;
+          },
+        },
+        { inputs: MIN_VALUES },
+      ]
+    ).walk(ROOT);
+    for (const _ of minify) {
     }
     /*
     console.error(
