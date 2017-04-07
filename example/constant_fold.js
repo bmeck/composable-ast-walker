@@ -25,7 +25,7 @@ const IN_PRAGMA_POS = path => {
     }
   }
   return true;
-}
+};
 const IS_PRAGMA = path => {
   if (path.parent && Array.isArray(path.parent.node)) {
     const siblings = path.parent.node;
@@ -41,7 +41,30 @@ const IS_PRAGMA = path => {
     }
   }
   return true;
-}
+};
+// worst case is the completion value
+const IS_NOT_COMPLETION = path => {
+  while (true) {
+    if (!path.parent) {
+      return true;
+    }
+    if (
+      Array.isArray(path.parent.node) &&
+      path.key !== path.parent.node.length - 1
+    ) {
+      return true;
+    }
+    path = path.parent;
+    while (Array.isArray(path.node)) {
+      path = path.parent;
+    }
+    if (/Function/.test(path.node.type)) {
+      return true;
+    } else if (path.node.type === 'Program') {
+      return false;
+    }
+  }
+};
 const REMOVE_IF_EMPTY = path => {
   if (IS_EMPTY(path)) REMOVE(path);
   return null;
@@ -51,7 +74,6 @@ const REPLACE_IF_EMPTY = (path, folded) => {
   return path;
 };
 const REMOVE = path => {
-  console.log(path);
   if (Array.isArray(path.parent.node)) {
     path.parent.node.splice(path.key, 1);
   } else {
@@ -76,12 +98,17 @@ const NULL = Object.freeze({
 });
 const NAN = Object.freeze({
   [$CONSTEXPR]: true,
-  type: 'UnaryExpression',
-  operator: '+',
-  argument: Object.freeze({
+  type: 'BinaryExpression',
+  operator: '/',
+  left: Object.freeze({
     [$CONSTEXPR]: true,
     type: 'Literal',
-    value: '_',
+    value: 0,
+  }),
+  right: Object.freeze({
+    [$CONSTEXPR]: true,
+    type: 'Literal',
+    value: 0,
   }),
 });
 const NEG_ZERO = Object.freeze({
@@ -221,6 +248,7 @@ const TO_CONSTEXPR = value => {
   }
   throw Error('Not a CONSTVALUE (did you pass a RegExp?)');
 };
+
 // THIS DOES NOT HANDLE NODE SPECIFIC CASES LIKE IfStatement
 const FOLD_EMPTY = function*(path) {
   if (
@@ -230,31 +258,16 @@ const FOLD_EMPTY = function*(path) {
     Array.isArray(path.parent.node) &&
     IS_EMPTY(path)
   ) {
+    console.error('FOLD_EMPTY');
     REMOVE(path);
     return path.parent;
   }
   return yield path;
 };
 const FOLD_EXPR_STMT = function*(path) {
-  foldable: if (path && path.node && path.node.type === 'ExpressionStatement') {
-    let completion_check_path = path;
-    while (true) {
-      if (
-        completion_check_path.parent &&
-        Array.isArray(completion_check_path.parent.node)
-      ) {
-        // not last in block
-        if (
-          completion_check_path.key !==
-          completion_check_path.parent.node.length - 1
-        ) {
-          break;
-        }
-      } else if (completion_check_path.node.type === 'Program') {
-        break foldable;
-      }
-      completion_check_path = completion_check_path.parent;
-    }
+  // TODO: enforce completion value checking
+  if (path && path.node && path.node.type === 'ExpressionStatement') {
+    console.error('FOLD_EXPR_STMT');
     // merge all the adjacent expression statements into sequences
     if (Array.isArray(path.parent.node)) {
       // could have nodes after it
@@ -270,10 +283,8 @@ const FOLD_EXPR_STMT = function*(path) {
           }
           if (mergeable.length > 1) {
             siblings.splice(path.key, mergeable.length, {
-              [$CONSTEXPR]: true,
               type: 'ExpressionStatement',
               expression: {
-                [$CONSTEXPR]: true,
                 type: 'SequenceExpression',
                 expressions: mergeable.reduce(
                   (acc, es) => {
@@ -291,7 +302,8 @@ const FOLD_EXPR_STMT = function*(path) {
           }
         }
       }
-    } else if (IS_CONSTEXPR(path.node.expression)) {
+    }
+    if (IS_NOT_COMPLETION(path) && IS_CONSTEXPR(path.node.expression)) {
       return REPLACE(path, EMPTY);
     }
   }
@@ -300,9 +312,11 @@ const FOLD_EXPR_STMT = function*(path) {
 const FOLD_WHILE = function*(path) {
   if (path && path.node) {
     if (path.node.type === 'DoWhileStatement') {
+      console.error('FOLD_DOWHILE');
       REPLACE_IF_EMPTY(path.get(['body']), EMPTY);
     }
     if (path.node.type === 'WhileStatement') {
+      console.error('FOLD_WHILE');
       let { test, consequent, alternate } = path.node;
       if (IS_CONSTEXPR(test)) {
         test = CONSTVALUE(test);
@@ -313,6 +327,7 @@ const FOLD_WHILE = function*(path) {
       REPLACE_IF_EMPTY(path.get(['body']), EMPTY);
     }
     if (path.node.type === 'ForStatement') {
+      console.error('FOLD_FOR');
       REPLACE_IF_EMPTY(path.get(['body']), EMPTY);
       let { init, test, update } = path.node;
       let updated = false;
@@ -345,7 +360,40 @@ const FOLD_WHILE = function*(path) {
 };
 const FOLD_IF = function*(path) {
   if (path && path.node && path.node.type === 'IfStatement') {
+    console.error('FOLD_IF');
     let { test, consequent, alternate } = path.node;
+    const is_not_completion = IS_NOT_COMPLETION(path);
+    if (is_not_completion && !alternate) {
+      if (IS_EMPTY(path.get(['consequent']))) {
+        return REPLACE(path, {
+          type: 'ExpressionStatement',
+          expression: test,
+        });
+      }
+    }
+    if (consequent.type === 'ExpressionStatement') {
+      if (alternate) {
+        if (alternate.type === 'ExpressionStatement') {
+          return REPLACE(path, {
+            type: 'ConditionalExpression',
+            test: test,
+            consequent: consequent.expression,
+            alternate: alternate.expression,
+          });
+        }
+      }
+      else if (is_not_completion) {
+        return REPLACE(path, {
+          type: 'ExpressionStatement',
+          expression: {
+            type: 'BinaryExpression',
+            operator: '&&',
+            left: test,
+            right: consequent.expression,
+          }
+        });
+      }
+    }
     if (IS_CONSTEXPR(test)) {
       test = CONSTVALUE(test);
       if (test) {
@@ -357,20 +405,29 @@ const FOLD_IF = function*(path) {
       return REPLACE(path, EMPTY);
     }
     consequent = path.get(['consequent']);
+    let updated;
     if (consequent.node !== EMPTY) {
       REPLACE_IF_EMPTY(consequent, EMPTY);
-      return path;
+      if (consequent.parent.node[consequent.key] === EMPTY) {
+        updated = true;
+      }
     }
     if (alternate) {
       alternate = path.get(['alternate']);
       REMOVE_IF_EMPTY(alternate);
-      return alternate;
+      if (path.node.alternate === null) {
+        updated = true;
+      }
+    }
+    if (updated) {
+      return path;
     }
   }
   return yield path;
 };
 const FOLD_SEQUENCE = function*(path) {
   if (path && path.node && path.node.type === 'SequenceExpression') {
+    console.error('FOLD_SEQUENCE');
     // never delete the last value
     for (let i = 0; i < path.node.expressions.length - 1; i++) {
       if (IS_CONSTEXPR(path.node.expressions[i])) {
@@ -386,6 +443,7 @@ const FOLD_SEQUENCE = function*(path) {
 };
 const FOLD_LOGICAL = function*(path) {
   if (path && path.node && path.node.type === 'LogicalExpression') {
+    console.error('FOLD_LOGICAL');
     let { left, right, operator } = path.node;
     if (IS_CONSTEXPR(left)) {
       left = CONSTVALUE(left);
@@ -404,8 +462,21 @@ const FOLD_LOGICAL = function*(path) {
   }
   return yield path;
 };
+const FOLD_UNREACHABLE = function*(path) {
+  if (path && path.node && path.parent && Array.isArray(path.parent.node)) {
+    if (path.node.type === 'ReturnStatement' ||
+    path.node.type === 'ContinueStatement' ||
+    path.node.type === 'BreakStatement' ||
+    path.node.type === 'ThrowStatement') {
+      const next_key = path.key + 1;
+      path.parent.node.splice(next_key, path.parent.node.length - next_key);
+    }
+  }
+  return yield path;
+}
 const FOLD_CONDITIONAL = function*(path) {
   if (path && path.node && path.node.type === 'ConditionalExpression') {
+    console.error('FOLD_CONDITIONAL');
     let { test, consequent, alternate } = path.node;
     if (IS_CONSTEXPR(test)) {
       test = CONSTVALUE(test);
@@ -418,8 +489,28 @@ const FOLD_CONDITIONAL = function*(path) {
   return yield path;
 };
 const FOLD_BINARY = function*(path) {
-  if (path && path.node && path.node.type === 'BinaryExpression') {
+  if (
+    path &&
+    path.node &&
+    path.node.type === 'BinaryExpression' &&
+    !IS_NAN(path.node)
+  ) {
+    console.error('FOLD_BINARY');
     let { left, right, operator } = path.node;
+    if (operator === '==' || operator === '!=') {
+      let updated = false;
+      if (IS_UNDEFINED(left)) {
+        updated = true;
+        REPLACE(path.get(['left']), NULL);
+      }
+      if (IS_UNDEFINED(right)) {
+        updated = true;
+        REPLACE(path.get(['right']), NULL);
+      }
+      if (updated) {
+        return path;
+      }
+    }
     if (IS_CONSTEXPR(left) && IS_CONSTEXPR(right)) {
       left = CONSTVALUE(left);
       right = CONSTVALUE(right);
@@ -468,6 +559,7 @@ const FOLD_BINARY = function*(path) {
 };
 const FOLD_UNARY = function*(path) {
   if (path && path.node && path.node.type === 'UnaryExpression') {
+    console.error('FOLD_UNARY');
     if (IS_CONSTEXPR(path.node)) {
       return yield path;
     }
@@ -497,6 +589,7 @@ const FOLD_UNARY = function*(path) {
 };
 const FOLD_MEMBER = function*(path) {
   if (path && path.node && path.node.type === 'MemberExpression') {
+    console.error('FOLD_MEMBER');
     if (path.node.computed && path.node.property.type === 'Literal') {
       const current = `${CONSTVALUE(path.node.property)}`;
       if (typeof current === 'string' && /^[$_a-z][$_a-z\d]*$/i.test(current)) {
@@ -521,17 +614,17 @@ const FOLD_MEMBER = function*(path) {
             const desc = Object.getOwnPropertyDescriptor(value, key);
             if (desc) {
               const folded = value[key];
-              console.error('FOLDING', JSON.stringify(folded))
+              console.error('FOLDING', JSON.stringify(folded));
               if (IN_PRAGMA_POS(path) && typeof folded === 'string') {
                 if (value.length > 1) {
                   REPLACE(
-                    path.get(['object']), TO_CONSTEXPR(value.slice(key, key + 1)));
-                  REPLACE(
-                    path.get(['property']), TO_CONSTEXPR(0));
+                    path.get(['object']),
+                    TO_CONSTEXPR(value.slice(key, key + 1))
+                  );
+                  REPLACE(path.get(['property']), TO_CONSTEXPR(0));
                   return path;
                 }
-              }
-              else {
+              } else {
                 return REPLACE(path, TO_CONSTEXPR(value[key]));
               }
             }
@@ -542,42 +635,70 @@ const FOLD_MEMBER = function*(path) {
   }
   return yield path;
 };
-const WALKER = WalkCombinator.pipe(
-  ...[
-    WalkCombinator.DEPTH_FIRST,
-    { inputs: FOLD_WHILE },
-    { inputs: FOLD_IF },
-    { inputs: FOLD_EXPR_STMT },
-    { inputs: FOLD_EMPTY },
-    { inputs: FOLD_CONDITIONAL },
-    { inputs: FOLD_LOGICAL },
-    { inputs: FOLD_BINARY },
-    { inputs: FOLD_UNARY },
-    { inputs: FOLD_SEQUENCE },
-    { inputs: FOLD_MEMBER },
-  ]
-);
 
 process.stdin.pipe(
   require('mississippi').concat(buff => {
     const ROOT = new NodePath(
       null,
-      require('esprima').parse(`${buff}`, {
-        // loc: true,
-        // source: '<stdin>',
-      }),
+      require('esprima').parse(
+        `${buff}`,
+        {
+          // loc: true,
+          // source: '<stdin>',
+        }
+      ),
       null
     );
-    const walk = WALKER.walk(ROOT);
-    for (const _ of walk) {
+    // all of these are things that could affect completion value positions
+    const walk_expressions = WalkCombinator.pipe(
+      ...[
+        WalkCombinator.DEPTH_FIRST,
+        {
+          // We never work on Arrays
+          *inputs(path) {
+            if (Array.isArray(path)) return;
+            return yield path;
+          },
+        },
+        { inputs: FOLD_UNREACHABLE },
+        { inputs: FOLD_EXPR_STMT },
+        { inputs: FOLD_CONDITIONAL },
+        { inputs: FOLD_LOGICAL },
+        { inputs: FOLD_BINARY },
+        { inputs: FOLD_UNARY },
+        { inputs: FOLD_SEQUENCE },
+        { inputs: FOLD_MEMBER },
+      ]
+    ).walk(ROOT);
+    for (const _ of walk_expressions) {
     }
-    console.log(
+    // none of these will affect completion values
+    const walk_statements = WalkCombinator.pipe(
+      ...[
+        WalkCombinator.DEPTH_FIRST,
+        {
+          // We never work on Arrays
+          *inputs(path) {
+            if (Array.isArray(path)) return;
+            return yield path;
+          },
+        },
+        { inputs: FOLD_EMPTY },
+        { inputs: FOLD_IF },
+        { inputs: FOLD_WHILE },
+      ]
+    ).walk(ROOT);
+    for (const _ of walk_statements) {
+    }
+    /*
+    console.error(
       '%s',
       require('util').inspect(ROOT.node, {
         depth: null,
         colors: true,
       })
     );
+    */
     const out = require('escodegen').generate(ROOT.node);
     console.log(out);
   })
