@@ -87,6 +87,42 @@ const REPLACE = (path, folded) => {
   return replacement;
 };
 // no mutation, this is an atomic value
+const NEG_ZERO = Object.freeze({
+  [$CONSTEXPR]: true,
+  type: 'UnaryExpression',
+  operator: '-',
+  argument: Object.freeze({
+    [$CONSTEXPR]: true,
+    type: 'Literal',
+    value: 0,
+  }),
+});
+const INFINITY = Object.freeze({
+  [$CONSTEXPR]: true,
+  type: 'BinaryExpression',
+  operator: '/',
+  left: Object.freeze({
+    [$CONSTEXPR]: true,
+    type: 'Literal',
+    value: 1,
+  }),
+  right: Object.freeze({
+    [$CONSTEXPR]: true,
+    type: 'Literal',
+    value: 0,
+  }),
+});
+const NEG_INFINITY = Object.freeze({
+  [$CONSTEXPR]: true,
+  type: 'BinaryExpression',
+  operator: '/',
+  left: Object.freeze({
+    [$CONSTEXPR]: true,
+    type: 'Literal',
+    value: 1,
+  }),
+  right: NEG_ZERO,
+});
 const EMPTY = Object.freeze({
   [$CONSTEXPR]: true,
   type: 'EmptyStatement',
@@ -106,16 +142,6 @@ const NAN = Object.freeze({
     value: 0,
   }),
   right: Object.freeze({
-    [$CONSTEXPR]: true,
-    type: 'Literal',
-    value: 0,
-  }),
-});
-const NEG_ZERO = Object.freeze({
-  [$CONSTEXPR]: true,
-  type: 'UnaryExpression',
-  operator: '-',
-  argument: Object.freeze({
     [$CONSTEXPR]: true,
     type: 'Literal',
     value: 0,
@@ -161,6 +187,22 @@ const IS_CONSTEXPR = node => {
     }
     return true;
   }
+  if (node.type === 'ObjectExpression') {
+    for (let i = 0; i < node.properties.length; i++) {
+      const element = node.properties[i];
+      if (element.kind !== 'init') return false;
+      if (element.method) return false;
+      let key;
+      if (element.computed) {
+        // be sure {["y"]:1} works
+        if (!IS_CONSTEXPR(element.key)) {
+          return false;
+        }
+      }
+      if (!IS_CONSTEXPR(element.value)) return false;
+    }
+    return true;
+  }
   if (node.type === 'Literal' || IS_UNDEFINED(node) || IS_NAN(node)) {
     return true;
   }
@@ -192,6 +234,28 @@ const CONSTVALUE = node => {
     }
     return ret;
   }
+  if (node.type === 'ObjectExpression') {
+    let ret = Object.create(null);
+    for (let i = 0; i < node.properties.length; i++) {
+      const element = node.properties[i];
+      let key;
+      if (element.computed) {
+        key = `${CONSTVALUE(element.key)}`;
+      }
+      else {
+        key = element.key.name;
+      }
+      Object.defineProperty(ret, key, {
+        // duplicate keys...
+        configurable: true,
+        writable: true,
+        value: CONSTVALUE(element.value),
+        enumerable: true
+      });
+    }
+    Object.freeze(ret);
+    return ret;
+  }
   if (IS_UNARY_NEGATIVE(node)) {
     return -node.argument.value;
   }
@@ -205,6 +269,12 @@ CONSTEXPRS.set(void 0, UNDEFINED);
 CONSTEXPRS.set(+'_', NAN);
 CONSTEXPRS.set(null, NULL);
 const TO_CONSTEXPR = value => {
+  if (value === -Infinity) {
+    return NEG_INFINITY;
+  }
+  if (value === Infinity) {
+    return INFINITY;
+  }
   let is_neg_zero = 1 / value === -Infinity;
   if (is_neg_zero) return NEG_ZERO;
   if (CONSTEXPRS.has(value)) {
@@ -246,6 +316,30 @@ const TO_CONSTEXPR = value => {
       elements: Object.freeze(value.map(TO_CONSTEXPR)),
     });
   }
+  if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.getPrototypeOf({}) && [...Object.getOwnPropertySymbols(value)].length === 0) {
+    return Object.freeze({
+      [$CONSTEXPR]: true,
+      type: 'ObjectExpression',
+      properties: Object.freeze(
+        [...Object.getOwnPropertyKeys(value)].map(key => {
+          if (!('value' in Object.getOwnProperty(value, key))) {
+            throw Error('Not a CONSTVALUE (found a setter or getter?)');
+          }
+          return {
+            type: 'Property',
+            kind: 'init',
+            method: false,
+            shorthand: false,
+            computed: true,
+            key: {
+              type: 'Literal',
+              value: key
+            },
+            value: TO_CONSTEXPR(value[key])
+          }
+        })),
+      });
+  }
   throw Error('Not a CONSTVALUE (did you pass a RegExp?)');
 };
 
@@ -258,9 +352,25 @@ const FOLD_EMPTY = function*(path) {
     Array.isArray(path.parent.node) &&
     IS_EMPTY(path)
   ) {
-    console.error('FOLD_EMPTY');
     REMOVE(path);
-    return path.parent;
+    return yield;
+  }
+  return yield path;
+};
+
+// THIS DOES NOT HANDLE NODE SPECIFIC CASES LIKE IfStatement
+const FOLD_TEMPLATE = function*(path) {
+  if (
+    path &&
+    path.node &&
+    path.type === 'TemplateLiteral'
+  ) {
+    let updated = false;
+    for (let i = 0; i < path.node.exressions.length; i++) {
+      if (IS_CONSTEXPR(path.node.expressions[i])) {
+        //let 
+      }
+    }
   }
   return yield path;
 };
@@ -416,7 +526,6 @@ const FOLD_IF = function*(path) {
           right: consequent.expression,
         }
       });
-        console.log('RETRY', path.parent)
       return path.parent;
     }
     if (IS_CONSTEXPR(test)) {
@@ -487,6 +596,46 @@ const FOLD_LOGICAL = function*(path) {
   }
   return yield path;
 };
+const FOLD_SWITCH = function*(path) {
+  if (path && path.node && path.node.type === 'SwitchStatement') {
+    let { discriminant, cases } = path.node;
+    // if there are no cases, just become an expression
+    if (cases.length === 0 && IS_NOT_COMPLETION(path)) {
+      return REPLACE(path, {
+        type: 'ExpressionStatement',
+        expression: discriminant
+      });
+    }
+    // if the discriminant is static
+    //   remove any preceding non-matching static cases
+    //   fold any trailing cases into the matching case
+    if (cases.length > 1 && IS_CONSTEXPR(discriminant)) {
+      const discriminant_value = CONSTVALUE(discriminant);
+      for (var i = 0; i < cases.length; i++) {
+        const test = cases[i].test;
+        if (IS_CONSTEXPR(test)) {
+          let test_value = CONSTVALUE(test);
+          if (discriminant_value === test_value) {
+            let new_consequent = cases[i].consequent;
+            if (i < cases.length - 1) {
+              for (let fallthrough of cases.slice(i+1)) {
+                new_consequent.push(...fallthrough.consequent);
+              }
+            }
+            cases[i].consequent = new_consequent;
+            REPLACE(path.get(['cases']), [cases[i]]);
+            return path;
+          }
+        }
+        else {
+          // we had a dynamic case need to bail
+          break;
+        }
+      }
+    }
+  }
+  return yield path;
+};
 const FOLD_UNREACHABLE = function*(path) {
   if (path && path.node && path.parent && Array.isArray(path.parent.node)) {
     if (path.node.type === 'ReturnStatement' ||
@@ -536,51 +685,67 @@ const FOLD_BINARY = function*(path) {
         return path;
       }
     }
-    if (IS_CONSTEXPR(left) && IS_CONSTEXPR(right)) {
+    if (path.node !== INFINITY && path.node !== NEG_INFINITY && IS_CONSTEXPR(left) && IS_CONSTEXPR(right)) {
       left = CONSTVALUE(left);
       right = CONSTVALUE(right);
       let value;
-      if (operator === '+') {
-        value = left + right;
-      } else if (operator === '-') {
-        value = left - right;
-      } else if (operator === '*') {
-        value = left * right;
-      } else if (operator === '/') {
-        value = left / right;
-      } else if (operator === '%') {
-        value = left % right;
-      } else if (operator === '==') {
-        value = left == right;
-      } else if (operator === '!=') {
-        value = left != right;
-      } else if (operator === '===') {
-        value = left === right;
-      } else if (operator === '!==') {
-        value = left !== right;
-      } else if (operator === '<') {
-        value = left < right;
-      } else if (operator === '<=') {
-        value = left <= right;
-      } else if (operator === '>') {
-        value = left > right;
-      } else if (operator === '>=') {
-        value = left >= right;
-      } else if (operator === '<<') {
-        value = left << right;
-      } else if (operator === '>>') {
-        value = left >> right;
-      } else if (operator === '>>>') {
-        value = left >>> right;
-      } else if (operator === '|') {
-        value = left | right;
-      } else if (operator === '&') {
-        value = left & right;
-      } else if (operator === '^') {
-        value = left ^ right;
+      if ((!left || typeof left !== 'object') && (!right || typeof right !== 'object')) {
+        if (operator === '+') {
+          value = left + right;
+        } else if (operator === '-') {
+          value = left - right;
+        } else if (operator === '*') {
+          value = left * right;
+        } else if (operator === '/') {
+          value = left / right;
+        } else if (operator === '%') {
+          value = left % right;
+        } else if (operator === '==') {
+          value = left == right;
+        } else if (operator === '!=') {
+          value = left != right;
+        } else if (operator === '===') {
+          value = left === right;
+        } else if (operator === '!==') {
+          value = left !== right;
+        } else if (operator === '<') {
+          value = left < right;
+        } else if (operator === '<=') {
+          value = left <= right;
+        } else if (operator === '>') {
+          value = left > right;
+        } else if (operator === '>=') {
+          value = left >= right;
+        } else if (operator === '<<') {
+          value = left << right;
+        } else if (operator === '>>') {
+          value = left >> right;
+        } else if (operator === '>>>') {
+          value = left >>> right;
+        } else if (operator === '|') {
+          value = left | right;
+        } else if (operator === '&') {
+          value = left & right;
+        } else if (operator === '^') {
+          value = left ^ right;
+        }
       }
-      if (value == value && isFinite(value)) {
-        return REPLACE(path, TO_CONSTEXPR(value));
+      else {
+        if (operator === '==') value = false;
+        if (operator === '===') value = false;
+        if (operator === '!=') value = true;
+        if (operator === '!==') value = true;
+        if (operator === 'in' && typeof right === 'object' && right) {
+          value = Boolean(Object.getOwnPropertyDescriptor(right, left));
+        }
+      }
+      if (value !== void 0) {
+        if (typeof value === 'string' || typeof value === 'boolean' || value === null) {
+          return REPLACE(path, TO_CONSTEXPR(value));
+        }
+        if (typeof value === 'number') {
+          return REPLACE(path, TO_CONSTEXPR(value));
+        }
       }
     }
   }
@@ -616,6 +781,21 @@ const FOLD_UNARY = function*(path) {
   }
   return yield path;
 };
+const FOLD_EVAL = function*(path) {
+  if (path && path.node && path.node.type === 'CallExpression' &&
+    path.node.callee.type === 'Identifier' && path.node.callee.name === 'eval') {
+    console.error('FOLD_EVAL');
+    if (path.node.arguments.length === 1 && path.node.arguments[0].type === 'Literal') {
+      let result = require('esprima').parse(`${
+        CONSTVALUE(path.node.arguments[0])
+      }`);
+      if (result.body.length === 1 && result.body[0].type === 'ExpressionStatement') {
+        return REPLACE(path, result.body[0].expression);
+      }
+    }
+  }
+  return yield path;
+}
 const FOLD_MEMBER = function*(path) {
   if (path && path.node && path.node.type === 'MemberExpression') {
     console.error('FOLD_MEMBER');
@@ -632,30 +812,30 @@ const FOLD_MEMBER = function*(path) {
     }
     if (IS_CONSTEXPR(path.node.object)) {
       const value = CONSTVALUE(path.node.object);
-      if (typeof value === 'string' || Array.isArray(value)) {
-        if (!path.node.computed) {
-          if (path.node.property.name === 'length') {
-            return REPLACE(path, TO_CONSTEXPR(value.length));
-          }
-        } else if (IS_CONSTEXPR(path.node.property)) {
-          const key = +`${CONSTVALUE(path.node.property)}`;
-          if (key === key && key >= 0 && key < value.length) {
-            const desc = Object.getOwnPropertyDescriptor(value, key);
-            if (desc) {
-              const folded = value[key];
-              console.error('FOLDING', JSON.stringify(folded));
-              if (IN_PRAGMA_POS(path) && typeof folded === 'string') {
-                if (value.length > 1) {
-                  REPLACE(
-                    path.get(['object']),
-                    TO_CONSTEXPR(value.slice(key, key + 1))
-                  );
-                  REPLACE(path.get(['property']), TO_CONSTEXPR(0));
-                  return path;
-                }
-              } else {
-                return REPLACE(path, TO_CONSTEXPR(value[key]));
+      if (typeof value === 'string' || Array.isArray(value) || (value && typeof value === 'object')) {
+        let key;
+        if (IS_CONSTEXPR(path.node.property)) {
+          key = `${CONSTVALUE(path.node.property)}`;
+        }
+        else if (!path.node.computed) {
+          key = path.node.property.name;
+        }
+        if (key !== void 0) {
+          const desc = Object.getOwnPropertyDescriptor(value, key);
+          if (desc) {
+            const folded = value[key];
+            console.error('FOLDING', JSON.stringify(folded));
+            if (IN_PRAGMA_POS(path) && typeof folded === 'string') {
+              if (value.length > 1) {
+                REPLACE(
+                  path.get(['object']),
+                  TO_CONSTEXPR(value.slice(key, key + 1))
+                );
+                REPLACE(path.get(['property']), TO_CONSTEXPR(0));
+                return path;
               }
+            } else {
+              return REPLACE(path, TO_CONSTEXPR(value[key]));
             }
           }
         }
@@ -700,12 +880,11 @@ const MIN_VALUES = function*(path) {
   return yield path;
 }
 
-process.stdin.pipe(
-  require('mississippi').concat(buff => {
+const optimize = (src) => {
     const ROOT = new NodePath(
       null,
       require('esprima').parse(
-        `${buff}`,
+        src,
         {
           // loc: true,
           // source: '<stdin>',
@@ -726,6 +905,7 @@ process.stdin.pipe(
         },
         { inputs: FOLD_UNREACHABLE },
         { inputs: FOLD_IF },
+        { inputs: FOLD_SWITCH },
         { inputs: FOLD_EXPR_STMT },
         { inputs: FOLD_CONDITIONAL },
         { inputs: FOLD_LOGICAL },
@@ -733,26 +913,12 @@ process.stdin.pipe(
         { inputs: FOLD_UNARY },
         { inputs: FOLD_SEQUENCE },
         { inputs: FOLD_MEMBER },
+        { inputs: FOLD_EMPTY },
+        { inputs: FOLD_WHILE },
+        { inputs: FOLD_EVAL },
       ]
     ).walk(ROOT);
     for (const _ of walk_expressions) {
-    }
-    // none of these will affect completion values
-    const walk_statements = WalkCombinator.pipe(
-      ...[
-        WalkCombinator.DEPTH_FIRST,
-        {
-          // We never work on Arrays
-          *inputs(path) {
-            if (Array.isArray(path)) return;
-            return yield path;
-          },
-        },
-        { inputs: FOLD_EMPTY },
-        { inputs: FOLD_WHILE },
-      ]
-    ).walk(ROOT);
-    for (const _ of walk_statements) {
     }
     const minify = WalkCombinator.pipe(
       ...[
@@ -769,6 +935,11 @@ process.stdin.pipe(
     ).walk(ROOT);
     for (const _ of minify) {
     }
+    return ROOT;
+}
+process.stdin.pipe(
+  require('mississippi').concat(buff => {
+    const ROOT = optimize(`${buff}`)
     console.error(
       '%s',
       require('util').inspect(ROOT.node, {

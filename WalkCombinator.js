@@ -1,4 +1,5 @@
 'use strict';
+const {NodePath} = require('./NodePath');
 
 // An immutable walk combinator.
 // Instances are referred to as "walkers".
@@ -71,13 +72,16 @@ class WalkCombinator {
     }
     return walker;
   }
-  *walk(input, { visitor } = this) {
-    let iter = visitor.inputs(input);
+  *walk(input) {
+    if (input instanceof NodePath !== true) {
+      throw TypeError(`input must be a NodePath`);
+    }
+    let iter = this.visitor.inputs(input);
     let cmd;
     while (true) {
       let {value, done} = iter.next(cmd);
       if (done) return value;
-      cmd = yield* visitor.outputs(value);
+      cmd = yield* this.visitor.outputs(value);
     }
   }
 };
@@ -105,32 +109,49 @@ const toIter = (match, def = PASSTHROUGH) => {
 // It outputs every node it receives
 // @param {any} path
 //
+const SIMPLE_WALK = (depth_first = true) => {
+  return function* DEFAULT_WALKER(path) {
+      const node = path.node;
+      if (typeof node !== 'object' || !node) return;
+      if (!depth_first) {
+        const cmd = yield path;
+        if (cmd === WalkCombinator.SKIP) return;
+      };
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) {
+          let retry = path.get([i]);
+          do {
+            retry = yield* DEFAULT_WALKER(retry);
+          } while (retry !== void 0);
+        }
+      }
+      else {
+        for (const fieldName of Object.keys(node).sort()) {
+          let retry = path.get([fieldName]);
+          do {
+            retry = yield* DEFAULT_WALKER(retry);
+          } while (retry !== void 0);
+        }
+      }
+      if (depth_first) yield path;
+    }
+}
 WalkCombinator.DEPTH_FIRST = Object.freeze(
   Object.create(null, {
+    inputs: Object.freeze({
+      value: Object.freeze(SIMPLE_WALK(true)),
+      enumerable: true,
+    }),
+    outputs: Object.freeze({
+      value: Object.freeze(PASSTHROUGH),
+      enumerable: true,
+    }),
+  })
+);
+WalkCombinator.BREADTH_FIRST = Object.freeze(
+  Object.create(null, {
     inputs: {
-      value: function* DEFAULT_WALKER(path) {
-        console.log('COMPUTING AGAINST', path)
-        const node = path.node;
-        if (typeof node !== 'object' || !node) return;
-        let returns = [];
-        if (Array.isArray(node)) {
-          for (let i = 0; i < node.length; i++) {
-            let retry = path.get([i]);
-            do {
-              retry = yield* DEFAULT_WALKER(retry);
-            } while (retry !== void 0);
-          }
-        }
-        else {
-          for (const fieldName of Object.keys(node).sort()) {
-            let retry = path.get([fieldName]);
-            do {
-              retry = yield* DEFAULT_WALKER(retry);
-            } while (retry !== void 0);
-          }
-        }
-        return yield path;
-      },
+      value: SIMPLE_WALK(false),
       enumerable: true,
     },
     outputs: {
@@ -139,5 +160,6 @@ WalkCombinator.DEPTH_FIRST = Object.freeze(
     },
   })
 )
+WalkCombinator.SKIP = Symbol();
 Object.freeze(WalkCombinator);
 Object.freeze(WalkCombinator.prototype);
