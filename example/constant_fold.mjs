@@ -784,7 +784,7 @@ const FOLD_EVAL = function*(path) {
     path.node.callee.type === 'Identifier' && path.node.callee.name === 'eval') {
     console.error('FOLD_EVAL');
     if (path.node.arguments.length === 1 && path.node.arguments[0].type === 'Literal') {
-      let result = require('esprima').parse(`${
+      let result = esprima.parse(`${
         CONSTVALUE(path.node.arguments[0])
       }`);
       if (result.body.length === 1 && result.body[0].type === 'ExpressionStatement') {
@@ -878,6 +878,9 @@ const MIN_VALUES = function*(path) {
   return yield path;
 }
 
+import esprima from 'esprima';
+import util from 'util';
+import escodegen from 'escodegen';
 const optimize = (src) => {
     const ROOT = new NodePath(
       null,
@@ -935,8 +938,9 @@ const optimize = (src) => {
     }
     return ROOT;
 }
+import mississippi from 'mississippi';
 process.stdin.pipe(
-  require('mississippi').concat(buff => {
+  mississippi.concat(buff => {
     const ROOT = optimize(`${buff}`)
     console.error(
       '%s',
