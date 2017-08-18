@@ -1,8 +1,9 @@
 // consumes <stdin> and performs constant folding
 // echo '"use strict";"_"[0],1+2;' | node constant_fold.js
-'use strict';
-const NodePath = require('../NodePath').NodePath;
-const WalkCombinator = require('../WalkCombinator').WalkCombinator;
+import _NodePath from '../NodePath';
+const {NodePath} = _NodePath;
+import _WalkCombinator from '../WalkCombinator';
+const {WalkCombinator} = _WalkCombinator;
 
 const $CONSTEXPR = Symbol.for('$CONSTEXTR');
 const $CONSTVALUE = Symbol.for('$CONSTVALUE');
@@ -377,9 +378,6 @@ const FOLD_TEMPLATE = function*(path) {
 const FOLD_EXPR_STMT = function*(path) {
   // TODO: enforce completion value checking
   if (path && path.node && path.node.type === 'ExpressionStatement') {
-    console.error('FOLD_EXPR_STMT',
-      require('escodegen').generate(path.node)
-    );
     // merge all the adjacent expression statements into sequences
     if (Array.isArray(path.parent.node)) {
       // could have nodes after it
@@ -883,7 +881,7 @@ const MIN_VALUES = function*(path) {
 const optimize = (src) => {
     const ROOT = new NodePath(
       null,
-      require('esprima').parse(
+      esprima.parse(
         src,
         {
           // loc: true,
@@ -942,12 +940,12 @@ process.stdin.pipe(
     const ROOT = optimize(`${buff}`)
     console.error(
       '%s',
-      require('util').inspect(ROOT.node, {
+      util.inspect(ROOT.node, {
         depth: null,
         colors: true,
       })
     );
-    const out = require('escodegen').generate(ROOT.node);
+    const out = escodegen.generate(ROOT.node);
     console.log(out);
   })
 );
